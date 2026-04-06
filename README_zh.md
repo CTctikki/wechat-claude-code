@@ -79,7 +79,7 @@
 
 ## 与微信官方 MCP 插件对比
 
-微信官方提供了 [WeChat MCP](https://github.com/anthropics/claude-code/issues) 插件，本项目基于微信官方的 MCP 协议让 Claude code 读取微信消息。以下是两者的对比：
+微信官方提供了 [WeChat MCP](tencent-weixin/openclaw-weixin-cli) 插件，本项目基于微信官方的 MCP 协议让 Claude code 读取微信消息。以下是两者的对比：
 
 | 功能 | 本项目 (wechat-claude-code) | 微信官方 MCP 插件 |
 |------|:---:|:---:|
