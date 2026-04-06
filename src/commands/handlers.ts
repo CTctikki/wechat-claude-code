@@ -70,7 +70,8 @@ export function handleCwd(ctx: CommandContext, args: string): CommandResult {
 
 export function handleModel(ctx: CommandContext, args: string): CommandResult {
   if (!args) {
-    return { reply: '用法: /model <模型名称>\n例: /model claude-sonnet-4-6', handled: true };
+    const current = ctx.session.model ?? '(默认)';
+    return { reply: `当前模型: ${current}\n用法: /model <模型名称>\n例: /model claude-sonnet-4-6`, handled: true };
   }
   ctx.updateSession({ model: args });
   return { reply: `✅ 模型已切换为: ${args}`, handled: true };
@@ -226,6 +227,15 @@ export function handlePrompt(_ctx: CommandContext, args: string): CommandResult 
   config.systemPrompt = args.trim();
   saveConfig(config);
   return { reply: `✅ 系统提示词已设置:\n${config.systemPrompt}`, handled: true };
+}
+
+export function handleEcho(args: string): CommandResult {
+  if (!args) {
+    return { reply: '用法: /echo <消息>\n回显消息并显示往返延迟', handled: true };
+  }
+  const now = Date.now();
+  const reply = `${args}\n\n⏱ 往返时间: ${Date.now() - now}ms (插件处理)`;
+  return { reply, handled: true };
 }
 
 export function handleUnknown(cmd: string, args: string): CommandResult {

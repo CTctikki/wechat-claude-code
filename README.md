@@ -15,14 +15,14 @@ A [Claude Code](https://claude.ai/claude-code) Skill that bridges personal WeCha
 - Permission approval — reply `y`/`n` in WeChat to approve Claude's tool use
 - Slash commands — `/help`, `/clear`, `/model`, `/prompt`, `/status`, `/skills`, and more
 - Launch any installed Claude Code skill from WeChat
-- Cross-platform — macOS (launchd), Linux (systemd + nohup fallback)
+- Cross-platform — macOS (launchd), Linux (systemd + nohup fallback), Windows (PID file + nohup)
 - Session persistence — resume conversations across messages
 - Rate-limit safe — automatic exponential backoff on WeChat API throttling
 
 ## Prerequisites
 
 - Node.js >= 18
-- macOS or Linux
+- macOS or Linux or Windows (Git Bash / MSYS2)
 - Personal WeChat account (QR code binding required)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with `@anthropic-ai/claude-agent-sdk` installed
   > **Note:** The SDK supports third-party API providers (e.g. OpenRouter, AWS Bedrock, custom OpenAI-compatible endpoints) — set `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` accordingly.
@@ -32,7 +32,7 @@ A [Claude Code](https://claude.ai/claude-code) Skill that bridges personal WeCha
 Clone into your Claude Code skills directory:
 
 ```bash
-git clone https://github.com/Wechat-ggGitHub/wechat-claude-code.git ~/.claude/skills/wechat-claude-code
+git clone https://github.com/CTctikki/wechat-claude-code.git ~/.claude/skills/wechat-claude-code
 cd ~/.claude/skills/wechat-claude-code
 npm install
 ```
@@ -60,6 +60,7 @@ npm run daemon -- start
 
 - **macOS**: registers a launchd agent for auto-start and auto-restart
 - **Linux**: uses systemd user service (falls back to nohup if systemd unavailable)
+- **Windows**: uses PID file + nohup background process (run in Git Bash)
 
 ### 3. Chat in WeChat
 
@@ -119,7 +120,7 @@ WeChat (phone) ←→ ilink bot API ←→ Node.js daemon ←→ Claude Code SDK
 - Messages are forwarded to Claude Code via `@anthropic-ai/claude-agent-sdk`
 - Tool calls and thinking previews are streamed back as Claude works
 - Responses are sent back to WeChat with automatic rate-limit retry
-- Platform-native service management keeps the daemon running (launchd on macOS, systemd/nohup on Linux)
+- Platform-native service management keeps the daemon running (launchd on macOS, systemd/nohup on Linux, PID file/nohup on Windows)
 
 ## Data
 

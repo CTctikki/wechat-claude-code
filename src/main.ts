@@ -9,7 +9,8 @@ import { saveAccount, loadLatestAccount, type AccountData } from './wechat/accou
 import { startQrLogin, waitForQrScan } from './wechat/login.js';
 import { createMonitor, type MonitorCallbacks } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
-import { downloadImage, extractText, extractFirstImageUrl } from './wechat/media.js';
+import { downloadImage, extractText, extractFirstImageUrl, extractAllImageItems, extractVoiceText, extractFirstVoiceItem, extractFirstFileItem, downloadFile, extractRefMessage } from './wechat/media.js';
+import { createTypingManager } from './wechat/typing.js';
 import { createSessionStore, type Session } from './session.js';
 import { createPermissionBroker } from './permission.js';
 import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
@@ -18,6 +19,9 @@ import { loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
+import { homedir } from 'node:os';
+import { existsSync } from 'node:fs';
+import { resolve as resolvePath, extname } from 'node:path';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -182,8 +186,9 @@ async function runDaemon(): Promise<void> {
   }
 
   const sender = createSender(api, account.accountId);
-  const sharedCtx = { lastContextToken: '' };
-  const activeControllers = new Map<string, AbortController>();
+  const typingManager = createTypingManager(api);
+  const sharedCtx = { lastContextToken: session.lastContextToken ?? '' };
+  const activeControllers = new Map<string, { controller: AbortController; startedAt: number }>();
   const permissionBroker = createPermissionBroker(async () => {
     try {
       await sender.sendText(account.userId ?? '', sharedCtx.lastContextToken, '⏰ 权限请求超时，已自动拒绝。');
@@ -196,7 +201,7 @@ async function runDaemon(): Promise<void> {
 
   const callbacks: MonitorCallbacks = {
     onMessage: async (msg: WeixinMessage) => {
-      await handleMessage(msg, account, session, sessionStore, permissionBroker, sender, config, sharedCtx, activeControllers);
+      await handleMessage(msg, account, session, sessionStore, permissionBroker, sender, config, sharedCtx, activeControllers, typingManager);
     },
     onSessionExpired: () => {
       logger.warn('Session expired, will keep retrying...');
@@ -236,7 +241,8 @@ async function handleMessage(
   sender: ReturnType<typeof createSender>,
   config: ReturnType<typeof loadConfig>,
   sharedCtx: { lastContextToken: string },
-  activeControllers: Map<string, AbortController>,
+  activeControllers: Map<string, { controller: AbortController; startedAt: number }>,
+  typingManager: ReturnType<typeof createTypingManager>,
 ): Promise<void> {
   // Filter: only user messages with required fields
   if (msg.message_type !== MessageType.USER) return;
@@ -245,24 +251,74 @@ async function handleMessage(
   const contextToken = msg.context_token ?? '';
   const fromUserId = msg.from_user_id;
   sharedCtx.lastContextToken = contextToken;
+  // Persist context token to session for restart recovery
+  if (contextToken && session.lastContextToken !== contextToken) {
+    session.lastContextToken = contextToken;
+    sessionStore.save(account.accountId, session);
+  }
 
   // Extract text from items
-  const userText = extractTextFromItems(msg.item_list);
-  const imageItem = extractFirstImageUrl(msg.item_list);
+  let userText = extractTextFromItems(msg.item_list);
+  const imageItems = extractAllImageItems(msg.item_list);
+
+  // Debug: log item types to help diagnose unsupported message issues
+  logger.info('Message items received', {
+    itemTypes: msg.item_list.map(i => i.type),
+    hasText: !!userText,
+    imageCount: imageItems.length,
+  });
+
+  // Voice message support: use server-side speech-to-text if available
+  const voiceItem = extractFirstVoiceItem(msg.item_list);
+  if (voiceItem && !userText) {
+    const voiceText = extractVoiceText(voiceItem);
+    logger.info('Voice message received', {
+      hasVoiceText: !!voiceText,
+      voiceTextLength: voiceText?.length ?? 0,
+      voiceItemKeys: Object.keys(voiceItem.voice_item ?? {}),
+    });
+    if (voiceText) {
+      userText = `[语音消息] ${voiceText}`;
+    } else {
+      // No STT result — tell user to retry; don't fall through to "unsupported"
+      userText = '[语音消息] (语音识别未返回文字，请尝试重新发送或改用文字输入)';
+    }
+  }
+
+  // File message support: download and provide to Claude
+  const fileItem = extractFirstFileItem(msg.item_list);
+
+  // Quoted/referenced message support: prepend context
+  const ref = extractRefMessage(msg.item_list);
+  if (ref) {
+    userText = ref.prefix + (userText ? '\n' + userText : '');
+    // If quoted message has media and we have no images, use the referenced media
+    if (ref.mediaItem && imageItems.length === 0) {
+      imageItems.push(ref.mediaItem);
+    }
+  }
 
   // Concurrency guard: abort current query when new message arrives
+  const QUERY_GRACE_PERIOD_MS = 5_000; // don't abort queries younger than 5s
   if (session.state === 'processing') {
     if (userText.startsWith('/clear')) {
       // Force reset stuck session state
-      const ctrl = activeControllers.get(account.accountId);
-      if (ctrl) { ctrl.abort(); activeControllers.delete(account.accountId); }
+      const active = activeControllers.get(account.accountId);
+      if (active) { active.controller.abort(); activeControllers.delete(account.accountId); }
       session.state = 'idle';
       sessionStore.save(account.accountId, session);
       // Fall through to command routing so /clear executes normally
     } else if (!userText.startsWith('/')) {
+      const active = activeControllers.get(account.accountId);
+      if (active && Date.now() - active.startedAt < QUERY_GRACE_PERIOD_MS) {
+        // Query just started (e.g. downloading images) — don't abort, drop this message
+        logger.info('Ignoring message during query grace period', {
+          elapsed: Date.now() - active.startedAt,
+        });
+        return;
+      }
       // Abort the current query and process the new message instead
-      const ctrl = activeControllers.get(account.accountId);
-      if (ctrl) { ctrl.abort(); activeControllers.delete(account.accountId); }
+      if (active) { active.controller.abort(); activeControllers.delete(account.accountId); }
       session.state = 'idle';
       sessionStore.save(account.accountId, session);
       // Fall through to send new message to Claude
@@ -336,7 +392,7 @@ async function handleMessage(
       // Fall through to send the claudePrompt to Claude
       await sendToClaude(
         result.claudePrompt,
-        imageItem,
+        imageItems,
         fromUserId,
         contextToken,
         account,
@@ -346,6 +402,7 @@ async function handleMessage(
         sender,
         config,
         activeControllers,
+        typingManager,
       );
       return;
     }
@@ -360,14 +417,41 @@ async function handleMessage(
 
   // -- Normal message -> Claude --
 
-  if (!userText && !imageItem) {
-    await sender.sendText(fromUserId, contextToken, '暂不支持此类型消息，请发送文字或图片');
+  // Handle file messages: download and prepend file info to user text
+  if (fileItem && !userText && imageItems.length === 0) {
+    const fileData = await downloadFile(fileItem);
+    if (fileData) {
+      const isTextFile = fileData.mimeType.startsWith('text/') ||
+        ['application/json', 'application/xml', 'application/javascript'].includes(fileData.mimeType);
+      if (isTextFile && fileData.data.length < 100_000) {
+        // Small text files: inline content directly
+        const content = fileData.data.toString('utf-8');
+        userText = `[文件: ${fileData.fileName}]\n\n${content}`;
+      } else {
+        // Binary or large files: save to temp and tell Claude the path
+        const { writeFileSync, mkdirSync } = await import('node:fs');
+        const { join, resolve } = await import('node:path');
+        const { tmpdir } = await import('node:os');
+        const tempDir = join(tmpdir(), 'wechat-claude-code');
+        mkdirSync(tempDir, { recursive: true });
+        const tempPath = join(tempDir, fileData.fileName);
+        writeFileSync(tempPath, fileData.data);
+        userText = `用户发送了文件: ${fileData.fileName} (${fileData.mimeType}, ${fileData.data.length} bytes)\n文件已保存到: ${resolve(tempPath)}\n请分析这个文件。`;
+      }
+    } else {
+      await sender.sendText(fromUserId, contextToken, '⚠️ 文件下载失败，请重试。');
+      return;
+    }
+  }
+
+  if (!userText && imageItems.length === 0) {
+    await sender.sendText(fromUserId, contextToken, '暂不支持此类型消息，请发送文字、图片、语音或文件');
     return;
   }
 
   await sendToClaude(
     userText,
-    imageItem,
+    imageItems,
     fromUserId,
     contextToken,
     account,
@@ -377,6 +461,7 @@ async function handleMessage(
     sender,
     config,
     activeControllers,
+    typingManager,
   );
 }
 
@@ -386,7 +471,7 @@ function extractTextFromItems(items: NonNullable<WeixinMessage['item_list']>): s
 
 async function sendToClaude(
   userText: string,
-  imageItem: ReturnType<typeof extractFirstImageUrl>,
+  imageItems: import('./wechat/types.js').MessageItem[],
   fromUserId: string,
   contextToken: string,
   account: AccountData,
@@ -395,7 +480,8 @@ async function sendToClaude(
   permissionBroker: ReturnType<typeof createPermissionBroker>,
   sender: ReturnType<typeof createSender>,
   config: ReturnType<typeof loadConfig>,
-  activeControllers: Map<string, AbortController>,
+  activeControllers: Map<string, { controller: AbortController; startedAt: number }>,
+  typingManager: ReturnType<typeof createTypingManager>,
 ): Promise<void> {
   // Set state to processing
   session.state = 'processing';
@@ -403,30 +489,38 @@ async function sendToClaude(
 
   // Create abort controller for this query so it can be cancelled by new messages
   const abortController = new AbortController();
-  activeControllers.set(account.accountId, abortController);
+  activeControllers.set(account.accountId, { controller: abortController, startedAt: Date.now() });
 
   // Record user message in chat history
   sessionStore.addChatMessage(session, 'user', userText || '(图片)');
 
+  // Start typing indicator ("对方正在输入…")
+  const stopTyping = await typingManager.startTyping(fromUserId, contextToken);
+  let typingStopped = false;
+  const ensureTypingStopped = () => {
+    if (!typingStopped) { typingStopped = true; stopTyping(); }
+  };
+
   try {
-    // Download image if present
-    let images: QueryOptions['images'];
-    if (imageItem) {
-      const base64DataUri = await downloadImage(imageItem);
-      if (base64DataUri) {
-        // Convert data URI to the format Claude expects
-        const matches = base64DataUri.match(/^data:([^;]+);base64,(.+)$/);
-        if (matches) {
-          images = [
-            {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: matches[1],
-                data: matches[2],
-              },
-            },
-          ];
+    // Download images if present — save to temp files for Claude to read
+    // (The SDK's stdin transport doesn't pass image content blocks to the CLI process,
+    //  so we save images as files and reference them in the prompt instead.)
+    const imagePaths: string[] = [];
+    if (imageItems.length > 0) {
+      const { writeFileSync, mkdirSync } = await import('node:fs');
+      const imgDir = join(homedir(), '.wechat-claude-code', 'images');
+      try { mkdirSync(imgDir, { recursive: true }); } catch {}
+      for (const imgItem of imageItems) {
+        const base64DataUri = await downloadImage(imgItem);
+        if (base64DataUri) {
+          const matches = base64DataUri.match(/^data:([^;]+);base64,(.+)$/);
+          if (matches) {
+            const ext = matches[1].split('/')[1] || 'bin';
+            const imgPath = join(imgDir, `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`);
+            writeFileSync(imgPath, Buffer.from(matches[2], 'base64'));
+            imagePaths.push(imgPath);
+            logger.info('Image saved to temp file', { imgPath, size: matches[2].length });
+          }
         }
       }
     }
@@ -441,7 +535,7 @@ async function sendToClaude(
     let pendingBuffer = '';
     let anySent = false;
     let lastSendTime = Date.now(); // start the clock now, so first delta doesn't fire immediately
-    const SEND_INTERVAL_MS = 36_000;
+    const SEND_INTERVAL_MS = 12_000;
 
     // Send everything in pendingBuffer. force=true ignores rate limit.
     async function trySend(force = false): Promise<void> {
@@ -458,20 +552,30 @@ async function sendToClaude(
       }
     }
 
+    // Build prompt: if images were saved, prepend file paths so Claude can read them
+    let effectivePrompt = userText || '';
+    if (imagePaths.length > 0) {
+      const imageInstructions = imagePaths.length === 1
+        ? `[用户发送了一张图片，已保存到: ${imagePaths[0]}，请先用 Read 工具读取这张图片再回复]`
+        : `[用户发送了 ${imagePaths.length} 张图片，已保存到:\n${imagePaths.map(p => `  - ${p}`).join('\n')}\n请先用 Read 工具读取这些图片再回复]`;
+      effectivePrompt = imageInstructions + (effectivePrompt ? '\n' + effectivePrompt : '\n请分析这张图片');
+    }
+
     const queryOptions: QueryOptions = {
-      prompt: userText || '请分析这张图片',
-      cwd: (session.workingDirectory || config.workingDirectory).replace(/^~/, process.env.HOME || ''),
-      resume: session.sdkSessionId,
+      prompt: effectivePrompt,
+      cwd: (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir()),
+      resume: imagePaths.length > 0 ? undefined : session.sdkSessionId,
       model: session.model,
       systemPrompt: config.systemPrompt,
       permissionMode: sdkPermissionMode,
       abortController,
-      images,
       onText: async (delta: string) => {
+        ensureTypingStopped(); // Stop "typing..." once text starts flowing
         pendingBuffer += delta;
         await trySend();
       },
       onThinking: async (summary: string) => {
+        ensureTypingStopped(); // Stop "typing..." when tool calls appear
         pendingBuffer += (pendingBuffer ? '\n' : '') + summary;
         await trySend();
       },
@@ -514,8 +618,12 @@ async function sendToClaude(
       queryOptions.resume = undefined;
       session.sdkSessionId = undefined;
       sessionStore.save(account.accountId, session);
+      // Create a fresh AbortController — the previous one may already be aborted
+      const freshController = new AbortController();
+      activeControllers.set(account.accountId, { controller: freshController, startedAt: Date.now() });
+      queryOptions.abortController = freshController;
       const retryResult = await claudeQuery(queryOptions);
-      Object.assign(result, retryResult);
+      result = retryResult;
     }
 
     // Flush any remaining buffered content
@@ -541,6 +649,11 @@ async function sendToClaude(
       await sender.sendText(fromUserId, contextToken, 'ℹ️ Claude 无返回内容（可能因权限被拒而终止）');
     }
 
+    // Post-processing: detect file paths in Claude's output and send as media
+    if (result.text) {
+      await sendDetectedFiles(result.text, fromUserId, contextToken, sender);
+    }
+
     // Update session with new SDK session ID
     session.sdkSessionId = result.sessionId || undefined;
     session.state = 'idle';
@@ -558,9 +671,71 @@ async function sendToClaude(
     session.state = 'idle';
     sessionStore.save(account.accountId, session);
   } finally {
+    // Always stop typing indicator
+    ensureTypingStopped();
     // Clean up the abort controller if it's still ours
-    if (activeControllers.get(account.accountId) === abortController) {
+    const active = activeControllers.get(account.accountId);
+    if (active && active.controller === abortController) {
       activeControllers.delete(account.accountId);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// File detection & media sending helper
+// ---------------------------------------------------------------------------
+
+/** Media file extensions that should be sent back to WeChat automatically */
+const MEDIA_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg',
+  '.mp4', '.mov', '.avi', '.mkv', '.webm',
+  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  '.zip', '.tar', '.gz',
+  '.csv',
+]);
+
+/**
+ * Detect file paths in Claude's output that look like generated/saved files
+ * and send them back to WeChat as media messages.
+ */
+async function sendDetectedFiles(
+  text: string,
+  toUserId: string,
+  contextToken: string,
+  sender: ReturnType<typeof createSender>,
+): Promise<void> {
+  // Match common patterns like:
+  // "saved to /path/to/file.png"  "写入 /path/to/file.csv"  "文件已保存到: /path/to/output.pdf"
+  // Also match paths on their own lines, or in backticks
+  const pathPatterns = [
+    /(?:saved?|wrote|written|created|generated|output|保存|写入|生成|导出|输出)(?:\s+(?:to|at|in|到|至|:))?\s+[`"]?([^\s`"]+\.[a-zA-Z0-9]+)[`"]?/gi,
+    /(?:文件已保存到|文件路径|File saved|Output file)[:\s]+[`"]?([^\s`"]+\.[a-zA-Z0-9]+)[`"]?/gi,
+  ];
+
+  const detectedPaths = new Set<string>();
+
+  for (const pattern of pathPatterns) {
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      const filePath = match[1];
+      if (filePath && MEDIA_EXTENSIONS.has(extname(filePath).toLowerCase())) {
+        detectedPaths.add(filePath);
+      }
+    }
+  }
+
+  for (const filePath of detectedPaths) {
+    const absPath = resolvePath(filePath);
+    if (existsSync(absPath)) {
+      try {
+        await sender.sendMediaAuto(toUserId, contextToken, absPath);
+        logger.info('Auto-sent detected file', { path: absPath });
+      } catch (err) {
+        logger.warn('Failed to auto-send detected file', {
+          path: absPath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 }

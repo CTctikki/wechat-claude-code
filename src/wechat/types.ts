@@ -32,8 +32,14 @@ export interface CDNMedia {
 
 // ── Message Items ───────────────────────────────────────────────────────────
 
+export interface RefMessage {
+  message_item?: MessageItem;
+  title?: string;
+}
+
 export interface TextItem {
   text: string;
+  ref_msg?: RefMessage;
 }
 
 export interface ImageItem {
@@ -44,6 +50,7 @@ export interface ImageItem {
   url?: string;
   mid_size?: number;
   hd_size?: number;
+  encrypt_type?: number;
 }
 
 export interface VoiceItem {
@@ -54,10 +61,14 @@ export interface VoiceItem {
 export interface FileItem {
   cdn_media: CDNMedia;
   file_name?: string;
+  len?: number;
+  encrypt_type?: number;
 }
 
 export interface VideoItem {
   cdn_media: CDNMedia;
+  video_size?: number;
+  encrypt_type?: number;
 }
 
 export interface MessageItem {
@@ -95,6 +106,7 @@ export interface GetUpdatesResp {
   sync_buf: string;
   get_updates_buf: string;
   msgs?: WeixinMessage[];
+  longpolling_timeout_ms?: number;
 }
 
 // ── SendMessage API ─────────────────────────────────────────────────────────
@@ -113,16 +125,54 @@ export interface SendMessageReq {
   msg: OutboundMessage;
 }
 
+// ── GetConfig API (typing ticket) ───────────────────────────────────────────
+
+export interface GetConfigReq {
+  ilink_user_id: string;
+  context_token?: string;
+}
+
+export interface GetConfigResp {
+  ret?: number;
+  typing_ticket?: string;
+}
+
+// ── SendTyping API ──────────────────────────────────────────────────────────
+
+export enum TypingStatus {
+  TYPING = 1,
+  CANCEL = 2,
+}
+
+export interface SendTypingReq {
+  ilink_user_id: string;
+  typing_ticket: string;
+  status: TypingStatus;
+}
+
 // ── GetUploadUrl API ────────────────────────────────────────────────────────
 
+export enum UploadMediaType {
+  IMAGE = 1,
+  VIDEO = 2,
+  FILE = 3,
+}
+
 export interface GetUploadUrlReq {
-  file_type: string;
-  file_size: number;
-  file_name: string;
+  filekey: string;
+  media_type: number;
+  to_user_id: string;
+  rawsize: number;
+  rawfilemd5: string;
+  filesize: number;
+  no_need_thumb: boolean;
+  aeskey: string;
 }
 
 export interface GetUploadUrlResp {
   errcode: number;
+  upload_full_url?: string;
+  upload_param?: string;
   url: string;
   aes_key: string;
   encrypt_query_param: string;

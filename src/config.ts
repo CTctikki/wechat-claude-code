@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { join } from "node:path";
+import { DATA_DIR } from "./constants.js";
 
 export interface Config {
   workingDirectory: string;
@@ -9,15 +9,14 @@ export interface Config {
   systemPrompt?: string;
 }
 
-const CONFIG_DIR = join(homedir(), ".wechat-claude-code");
-const CONFIG_PATH = join(CONFIG_DIR, "config.env");
+const CONFIG_PATH = join(DATA_DIR, "config.env");
 
 const DEFAULT_CONFIG: Config = {
   workingDirectory: process.cwd(),
 };
 
 function ensureConfigDir(): void {
-  mkdirSync(CONFIG_DIR, { recursive: true });
+  mkdirSync(DATA_DIR, { recursive: true });
 }
 
 function parseConfigFile(content: string): Config {

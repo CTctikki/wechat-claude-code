@@ -1,7 +1,10 @@
 import type {
   GetUpdatesResp,
   SendMessageReq,
+  GetUploadUrlReq,
   GetUploadUrlResp,
+  GetConfigResp,
+  SendTypingReq,
 } from './types.js';
 import { logger } from '../logger.js';
 
@@ -86,12 +89,12 @@ export class WeChatApi {
     }
   }
 
-  /** Long-poll for new messages. Timeout 35s for long-polling. */
-  async getUpdates(buf?: string): Promise<GetUpdatesResp> {
+  /** Long-poll for new messages. Timeout adapts from server hint. */
+  async getUpdates(buf?: string, timeoutMs: number = 35_000): Promise<GetUpdatesResp> {
     return this.request<GetUpdatesResp>(
       'ilink/bot/getupdates',
       buf ? { get_updates_buf: buf } : {},
-      35_000,
+      timeoutMs + 5_000, // add 5s buffer over poll timeout to avoid client-side abort
     );
   }
 
@@ -116,14 +119,34 @@ export class WeChatApi {
   }
 
   /** Get a presigned upload URL for media files. */
-  async getUploadUrl(
-    fileType: string,
-    fileSize: number,
-    fileName: string,
-  ): Promise<GetUploadUrlResp> {
+  async getUploadUrl(req: GetUploadUrlReq): Promise<GetUploadUrlResp> {
     return this.request<GetUploadUrlResp>(
       'ilink/bot/getuploadurl',
-      { file_type: fileType, file_size: fileSize, file_name: fileName },
+      req,
     );
+  }
+
+  /** Get bot config (typing ticket) for a user. Timeout 10s. */
+  async getConfig(userId: string, contextToken?: string): Promise<GetConfigResp> {
+    return this.request<GetConfigResp>(
+      'ilink/bot/getconfig',
+      { ilink_user_id: userId, ...(contextToken ? { context_token: contextToken } : {}) },
+      10_000,
+    );
+  }
+
+  /** Send typing indicator. Fire-and-forget: errors are logged but never thrown. */
+  async sendTyping(req: SendTypingReq): Promise<void> {
+    try {
+      await this.request<{ ret?: number }>(
+        'ilink/bot/sendtyping',
+        req,
+        10_000,
+      );
+    } catch (err) {
+      logger.debug('sendTyping error (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 }

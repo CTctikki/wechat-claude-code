@@ -29,6 +29,8 @@ export interface Session {
   state: SessionState;
   chatHistory: ChatMessage[];
   maxHistoryLength?: number;
+  /** Persisted context_token from last WeChat message, used for typing indicators after restart */
+  lastContextToken?: string;
 }
 
 export interface PendingPermission {

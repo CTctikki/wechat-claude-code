@@ -1,9 +1,12 @@
 import { mkdirSync, appendFileSync, readdirSync, unlinkSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { join } from "node:path";
+import { DATA_DIR } from "./constants.js";
 
-const LOG_DIR = join(homedir(), ".wechat-claude-code", "logs");
+const LOG_DIR = join(DATA_DIR, "logs");
 const MAX_LOG_FILES = 30; // Keep at most 30 days of logs
+const DEBUG_ENABLED = process.env.WCC_DEBUG === "1";
+
+let logDirEnsured = false;
 
 /** Clean up old log files beyond MAX_LOG_FILES retention. */
 function cleanupOldLogs(): void {
@@ -23,6 +26,7 @@ function cleanupOldLogs(): void {
  * Redact sensitive values from a string:
  * - Bearer tokens (Authorization headers)
  * - aes_key values
+ * - context_token, bot_token, typing_ticket, and other sensitive fields
  * - generic token/secret values in JSON payloads
  */
 export function redact(obj: unknown): string {
@@ -32,20 +36,24 @@ export function redact(obj: unknown): string {
   let safe = raw;
   // Mask Bearer tokens: "Bearer <anything>"
   safe = safe.replace(/Bearer\s+[^\s"\\]+/gi, "Bearer ***");
-  // Mask generic token/secret/password/api_key values in JSON
+  // Mask sensitive field values in JSON (context_token, bot_token, typing_ticket, etc.)
   safe = safe.replace(
-    /"(?:(?:[\w]+_)?token|secret|password|api_key)"\s*:\s*"[^"]*"/gi,
+    /"(?:(?:[\w]+_)?token|secret|password|api_key|bot_token|context_token|typing_ticket|aes_key|aeskey)"\s*:\s*"[^"]*"/gi,
     (match) => {
       const key = match.match(/"[^"]*"/)?.[0] ?? '""';
       return `${key}: "***"`;
     },
   );
+  // Mask CDN query params that may contain tokens
+  safe = safe.replace(/encrypted_query_param=[^\s&"]+/gi, "encrypted_query_param=***");
   return safe;
 }
 
 function ensureLogDir(): void {
+  if (logDirEnsured) return;
   mkdirSync(LOG_DIR, { recursive: true });
   cleanupOldLogs();
+  logDirEnsured = true;
 }
 
 function getLogFilePath(): string {
@@ -62,7 +70,11 @@ function writeLogLine(level: string, message: string, data?: unknown): void {
     parts.push(redact(data));
   }
   const line = parts.join(" ") + "\n";
-  appendFileSync(getLogFilePath(), line, "utf-8");
+  try {
+    appendFileSync(getLogFilePath(), line, "utf-8");
+  } catch {
+    // Best-effort logging — never crash on write failure
+  }
 }
 
 export const logger = {
@@ -76,6 +88,8 @@ export const logger = {
     writeLogLine("ERROR", message, data);
   },
   debug(message: string, data?: unknown): void {
-    writeLogLine("DEBUG", message, data);
+    if (DEBUG_ENABLED) {
+      writeLogLine("DEBUG", message, data);
+    }
   },
 } as const;

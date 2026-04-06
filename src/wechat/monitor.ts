@@ -19,6 +19,7 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
   let stopped = false;
   const recentMsgIds = new Set<number>();
   const MAX_MSG_IDS = 1000;
+  let pollTimeoutMs = 35_000; // initial, adapts from server
 
   async function run(): Promise<void> {
     let consecutiveFailures = 0;
@@ -26,9 +27,14 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
     while (!controller.signal.aborted) {
       try {
         const buf = loadSyncBuf();
-        logger.debug('Polling for messages', { hasBuf: buf.length > 0 });
+        logger.debug('Polling for messages', { hasBuf: buf.length > 0, pollTimeoutMs });
 
-        const resp = await api.getUpdates(buf || undefined);
+        const resp = await api.getUpdates(buf || undefined, pollTimeoutMs);
+
+        // Adapt poll timeout from server hint
+        if (resp.longpolling_timeout_ms != null && resp.longpolling_timeout_ms > 0) {
+          pollTimeoutMs = resp.longpolling_timeout_ms;
+        }
 
         if (resp.ret === SESSION_EXPIRED_ERRCODE) {
           logger.warn('Session expired, pausing for 1 hour');

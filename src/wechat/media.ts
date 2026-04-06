@@ -80,8 +80,154 @@ export function extractText(item: MessageItem): string {
 }
 
 /**
+ * Extract referenced/quoted message context from items.
+ * Returns a formatted prefix and optionally the referenced media item.
+ */
+export function extractRefMessage(items?: MessageItem[]): { prefix: string; mediaItem?: MessageItem } | null {
+  if (!items) return null;
+
+  for (const item of items) {
+    const refMsg = item.text_item?.ref_msg;
+    if (!refMsg) continue;
+
+    const parts: string[] = [];
+    if (refMsg.title) parts.push(refMsg.title);
+
+    // Extract text from the referenced message item
+    if (refMsg.message_item) {
+      const refItem = refMsg.message_item;
+      const refText = refItem.text_item?.text;
+      if (refText) {
+        parts.push(refText.length > 100 ? refText.slice(0, 100) + '...' : refText);
+      } else if (refItem.type === MessageItemType.IMAGE) {
+        parts.push('[图片]');
+      } else if (refItem.type === MessageItemType.VOICE) {
+        const voiceText = refItem.voice_item?.voice_text;
+        parts.push(voiceText ? `[语音: ${voiceText}]` : '[语音]');
+      } else if (refItem.type === MessageItemType.FILE) {
+        parts.push(`[文件: ${refItem.file_item?.file_name ?? '未知'}]`);
+      } else if (refItem.type === MessageItemType.VIDEO) {
+        parts.push('[视频]');
+      }
+
+      // Check if the referenced item is media (image/video/file)
+      const isMedia = refItem.type === MessageItemType.IMAGE ||
+        refItem.type === MessageItemType.VIDEO ||
+        refItem.type === MessageItemType.FILE;
+
+      const prefix = `[引用: ${parts.join(' | ')}]`;
+      return {
+        prefix,
+        mediaItem: isMedia ? refItem : undefined,
+      };
+    }
+
+    if (parts.length > 0) {
+      return { prefix: `[引用: ${parts.join(' | ')}]` };
+    }
+  }
+
+  return null;
+}
+
+/**
  * Find the first IMAGE type item in a list.
  */
 export function extractFirstImageUrl(items?: MessageItem[]): MessageItem | undefined {
   return items?.find((item) => item.type === MessageItemType.IMAGE);
+}
+
+/**
+ * Find ALL IMAGE type items in a list.
+ */
+export function extractAllImageItems(items?: MessageItem[]): MessageItem[] {
+  return items?.filter((item) => item.type === MessageItemType.IMAGE) ?? [];
+}
+
+/**
+ * Extract voice-to-text content from a voice message item.
+ * Returns the server-side STT result if available, or null.
+ */
+export function extractVoiceText(item: MessageItem): string | null {
+  return item.voice_item?.voice_text ?? null;
+}
+
+/**
+ * Find the first VOICE type item in a list.
+ */
+export function extractFirstVoiceItem(items?: MessageItem[]): MessageItem | undefined {
+  return items?.find((item) => item.type === MessageItemType.VOICE);
+}
+
+/**
+ * Find the first FILE type item in a list.
+ */
+export function extractFirstFileItem(items?: MessageItem[]): MessageItem | undefined {
+  return items?.find((item) => item.type === MessageItemType.FILE);
+}
+
+/**
+ * Download a CDN file, decrypt it, and return the buffer + metadata.
+ * Works for FILE items that have cdn_media with aes_key and encrypt_query_param.
+ * Returns null on failure.
+ */
+export async function downloadFile(item: MessageItem): Promise<{ data: Buffer; fileName: string; mimeType: string } | null> {
+  const fileItem = item.file_item;
+  if (!fileItem) return null;
+
+  const cdnMedia = fileItem.cdn_media;
+  if (!cdnMedia?.aes_key || !cdnMedia?.encrypt_query_param) {
+    logger.warn('File item has no usable CDN data');
+    return null;
+  }
+
+  try {
+    const decrypted = await downloadAndDecrypt(cdnMedia.encrypt_query_param, cdnMedia.aes_key);
+    const fileName = fileItem.file_name ?? 'file.bin';
+    const mimeType = getMimeFromFileName(fileName);
+    logger.info('File downloaded and decrypted', { fileName, size: decrypted.length });
+    return { data: decrypted, fileName, mimeType };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn('Failed to download file', { error: msg });
+    return null;
+  }
+}
+
+/**
+ * Infer MIME type from file name extension.
+ */
+function getMimeFromFileName(fileName: string): string {
+  const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
+  const map: Record<string, string> = {
+    pdf: 'application/pdf',
+    doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ppt: 'application/vnd.ms-powerpoint',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    txt: 'text/plain',
+    csv: 'text/csv',
+    json: 'application/json',
+    xml: 'application/xml',
+    html: 'text/html',
+    md: 'text/markdown',
+    py: 'text/x-python',
+    js: 'text/javascript',
+    ts: 'text/typescript',
+    zip: 'application/zip',
+    tar: 'application/x-tar',
+    gz: 'application/gzip',
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    mp4: 'video/mp4',
+    mov: 'video/quicktime',
+  };
+  return map[ext] ?? 'application/octet-stream';
 }
